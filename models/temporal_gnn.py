@@ -24,23 +24,35 @@ class TemporalGNN(nn.Module):
         self.hidden_channels = hidden_channels
         self.num_layers = num_layers
         
-        # GNN layers
+        # Use JIT-compiled operations where possible
+        self.input_norm = torch.jit.script(nn.BatchNorm1d(node_features))
+        
+        # GNN layers with larger capacity for A5000
         self.convs = nn.ModuleList()
         self.batch_norms = nn.ModuleList()
         
-        # İlk katman
-        self.convs.append(GCNConv(node_features, hidden_channels))
-        self.batch_norms.append(nn.BatchNorm1d(hidden_channels))
+        # First layer with increased channels
+        self.convs.append(GCNConv(node_features, hidden_channels * 2))
+        self.batch_norms.append(torch.jit.script(nn.BatchNorm1d(hidden_channels * 2)))
         
-        # Ara katmanlar
-        for _ in range(num_layers - 1):
-            self.convs.append(GCNConv(hidden_channels, hidden_channels))
-            self.batch_norms.append(nn.BatchNorm1d(hidden_channels))
+        # Middle layers
+        for _ in range(num_layers - 2):
+            self.convs.append(GCNConv(hidden_channels * 2, hidden_channels * 2))
+            self.batch_norms.append(torch.jit.script(nn.BatchNorm1d(hidden_channels * 2)))
         
-        # Edge prediction layers - daha basit mimari
+        # Last layer
+        self.convs.append(GCNConv(hidden_channels * 2, hidden_channels))
+        self.batch_norms.append(torch.jit.script(nn.BatchNorm1d(hidden_channels)))
+        
+        # Edge prediction layers with increased capacity
         self.edge_predictor = nn.Sequential(
+            nn.Linear(hidden_channels * 2, hidden_channels * 2),
+            nn.ReLU(),
+            nn.BatchNorm1d(hidden_channels * 2),
+            nn.Dropout(dropout),
             nn.Linear(hidden_channels * 2, hidden_channels),
             nn.ReLU(),
+            nn.BatchNorm1d(hidden_channels),
             nn.Dropout(dropout),
             nn.Linear(hidden_channels, 1)
         )
@@ -58,14 +70,28 @@ class TemporalGNN(nn.Module):
         Returns:
             torch.Tensor: Node embeddings [num_nodes, hidden_channels]
         """
-        # Apply GNN layers with batch norm
-        for i, conv in enumerate(self.convs):
-            x = conv(x, edge_index)
-            x = self.batch_norms[i](x)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
+        # Input normalization
+        x = self.input_norm(x)
         
-        return x
+        # Apply GNN layers with residual connections
+        h = x
+        for i, conv in enumerate(self.convs[:-1]):  # All layers except last
+            h_new = conv(h, edge_index)
+            h_new = self.batch_norms[i](h_new)
+            h_new = F.relu(h_new)
+            h_new = F.dropout(h_new, p=self.dropout, training=self.training)
+            if h.shape == h_new.shape:  # Add residual if shapes match
+                h = h + h_new
+            else:
+                h = h_new
+        
+        # Last layer without residual
+        h = self.convs[-1](h, edge_index)
+        h = self.batch_norms[-1](h)
+        h = F.relu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+        
+        return h
     
     def predict_link(self, h, edge_index):
         """
@@ -93,7 +119,14 @@ class TemporalGNN(nn.Module):
         # Concatenate embeddings
         h_edge = torch.cat([h_src, h_dst], dim=1)
         
-        # Predict link probability
-        pred = self.edge_predictor(h_edge)
-        
-        return torch.sigmoid(pred).squeeze()
+        # Process in chunks if needed for large graphs
+        chunk_size = 32768  # Adjust based on GPU memory
+        if h_edge.shape[0] > chunk_size:
+            preds = []
+            for i in range(0, h_edge.shape[0], chunk_size):
+                chunk = h_edge[i:i + chunk_size]
+                pred_chunk = torch.sigmoid(self.edge_predictor(chunk)).squeeze()
+                preds.append(pred_chunk)
+            return torch.cat(preds)
+        else:
+            return torch.sigmoid(self.edge_predictor(h_edge)).squeeze()

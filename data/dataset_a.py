@@ -3,10 +3,12 @@ import pandas as pd
 import numpy as np
 from torch_geometric_temporal.signal import DynamicGraphTemporalSignal
 import os
+from tqdm import tqdm
+from datetime import datetime
 
 class EventBasedDataset:
     """
-    Dataset class for event-based temporal data.
+    Dataset class for event-based temporal data with proper temporal handling.
     """
     
     def __init__(self, name, time_window):
@@ -15,7 +17,7 @@ class EventBasedDataset:
         
         Args:
             name (str): Name of the dataset
-            time_window (int): Size of the time window for prediction
+            time_window (int): Size of the time window for prediction (in seconds)
         """
         self.name = name
         self.time_window = time_window
@@ -27,165 +29,301 @@ class EventBasedDataset:
         self.node_feature_path = "data/node_features.csv"
         self.edge_type_path = "data/edge_type_features.csv"
         
+        # New temporal attributes
+        self.temporal_edges = []  # List of (src, dst, timestamp, label) tuples
+        self.temporal_windows = []  # List of time windows
+        self.min_time = float('inf')
+        self.max_time = float('-inf')
+        
     def load_data(self, data_path):
         """
-        Load data from file.
-        
-        Args:
-            data_path (str): Path to the data file
+        Load data with temporal awareness and proper negative example handling.
         """
         print(f"Loading data from {data_path}")
         
-        # Load data from CSV
-        df = pd.read_csv(data_path, header=None)
+        # Count lines for progress bar
+        print("Counting total lines...")
+        total_lines = sum(1 for _ in open(data_path))
+        print(f"Total lines: {total_lines:,}")
         
-        # WSDM formatına göre düzenleme:
-        # edges_train_A.csv formatı: src_id, dst_id, edge_type, timestamp
-        if len(df.columns) == 4:
-            print("Detected edges_train format with 4 columns (src_id, dst_id, edge_type, timestamp)")
-            sources = df.iloc[:, 0].values
-            targets = df.iloc[:, 1].values
-            edge_types = df.iloc[:, 2].values
-            timestamps = df.iloc[:, 3].values
-            
-            # Test veri seti için label ekleme ihtiyacı yok, tüm kenarları pozitif olarak işaretliyoruz
-            labels = np.ones(len(sources), dtype=np.float32)
-            
-            # Kenar türü özelliklerini yüklemeye çalış
-            edge_type_features = None
-            try:
-                if self.edge_type_path and os.path.exists(self.edge_type_path):
-                    # Kategorik edge type özelliklerini yükle
-                    edge_type_df = pd.read_csv(self.edge_type_path)
-                    edge_type_features = []
-                    for edge_type in edge_types:
-                        # edge_type_df'de ilgili edge_type'ın özelliklerini bul
-                        type_features = edge_type_df[edge_type_df.iloc[:, 0] == edge_type].iloc[:, 1:].values
-                        if len(type_features) > 0:
-                            edge_type_features.append(type_features[0])
-                        else:
-                            # Eğer edge type bulunamazsa sıfır vektörü kullan
-                            edge_type_features.append(np.zeros(edge_type_df.shape[1] - 1))
-                    edge_type_features = np.array(edge_type_features, dtype=np.float32)
-                    print(f"Loaded edge type features from {self.edge_type_path}")
-                    # Edge type özelliklerini ve edge type'ı birleştir
-                    features = np.concatenate([np.expand_dims(edge_types, axis=1), edge_type_features], axis=1).astype(np.float32)
-            except Exception as e:
-                print(f"Warning: Could not load edge type features: {e}")
-                # Sadece edge type'ı özellik olarak kullan
-                features = np.expand_dims(edge_types, axis=1).astype(np.float32)
+        # Load data using pandas with optimized settings
+        print("Loading CSV data...")
+        df = pd.read_csv(
+            data_path, 
+            header=None,
+            engine='c',
+            dtype={
+                0: np.int32,  # src_id
+                1: np.int32,  # dst_id
+                2: np.int32,  # edge_type
+                3: np.float32,  # timestamp
+                4: np.int32  # label (if exists, otherwise will be dropped)
+            },
+            memory_map=True
+        )
         
-        # Test veri seti formatı: src_id, dst_id, edge_type, start_time, end_time, label
-        elif len(df.columns) == 6:
-            print("Detected test data format with 6 columns (src, dst, edge_type, start_time, end_time, label)")
-            sources = df.iloc[:, 0].values
-            targets = df.iloc[:, 1].values
-            edge_types = df.iloc[:, 2].values
-            
-            # Test veri setinde start_time ve end_time var. Biz başlangıç zamanını kullanıyoruz.
-            timestamps = df.iloc[:, 3].values
-            labels = df.iloc[:, 5].values
-            
-            # Kenar türünü bir özellik olarak kullanıyoruz
-            features = np.expand_dims(edge_types, axis=1).astype(np.float32)
-            
-        # Genel veri seti formatı: bunun dışındaki formatlar için
+        # Check if we have labels in the data
+        has_labels = df.shape[1] > 4
+        
+        # Convert to numpy arrays efficiently
+        sources = df.iloc[:, 0].to_numpy(dtype=np.int32)
+        targets = df.iloc[:, 1].to_numpy(dtype=np.int32)
+        edge_types = df.iloc[:, 2].to_numpy(dtype=np.int32)
+        timestamps = df.iloc[:, 3].to_numpy(dtype=np.float32)
+        
+        if has_labels:
+            labels = df.iloc[:, 4].to_numpy(dtype=np.int32)
         else:
-            print(f"Using general format with {len(df.columns)} columns")
-            sources = df.iloc[:, 0].values
-            targets = df.iloc[:, 1].values
-            
-            # Extract features (assuming columns 2 to -3 are features)
-            if len(df.columns) > 4:
-                features = df.iloc[:, 2:-2].values
-            else:
-                features = np.zeros((len(sources), 1), dtype=np.float32)
-            
-            # Extract timestamps and labels
-            if len(df.columns) >= 3:
-                timestamps = df.iloc[:, -2].values
-            else:
-                timestamps = np.zeros(len(sources))
-                
-            if len(df.columns) >= 4:
-                labels = df.iloc[:, -1].values  
-            else:
-                labels = np.ones(len(sources), dtype=np.float32)
+            # If no labels, assume all edges are positive
+            labels = np.ones_like(sources, dtype=np.int32)
         
-        # Node id mapping
+        # Update temporal bounds
+        self.min_time = min(self.min_time, timestamps.min())
+        self.max_time = max(self.max_time, timestamps.max())
+        
+        # Store temporal edges
+        temporal_data = list(zip(sources, targets, timestamps, labels))
+        temporal_data.sort(key=lambda x: x[2])  # Sort by timestamp
+        self.temporal_edges.extend(temporal_data)
+        
+        # Create time windows with optimized vectorization
+        print("Creating temporal windows...")
+        window_size = self.time_window
+        
+        # Calculate window boundaries more efficiently
+        min_time = timestamps.min()
+        max_time = timestamps.max()
+        num_windows = int(np.ceil((max_time - min_time) / window_size))
+        window_starts = min_time + np.arange(num_windows) * window_size
+        window_ends = window_starts + window_size
+        
+        # Pre-sort timestamps and corresponding data
+        sort_indices = np.argsort(timestamps)
+        sorted_timestamps = timestamps[sort_indices]
+        sorted_sources = sources[sort_indices]
+        sorted_targets = targets[sort_indices]
+        sorted_labels = labels[sort_indices]
+        
+        # Use binary search to find window boundaries
+        self.temporal_windows = []
+        
+        print(f"Processing {num_windows} windows...")
+        for start, end in tqdm(zip(window_starts, window_ends), total=num_windows):
+            # Binary search for start and end indices
+            start_idx = np.searchsorted(sorted_timestamps, start)
+            end_idx = np.searchsorted(sorted_timestamps, end)
+            
+            if start_idx < end_idx:  # Only create window if it contains edges
+                window_edges = list(zip(
+                    sorted_sources[start_idx:end_idx],
+                    sorted_targets[start_idx:end_idx],
+                    sorted_timestamps[start_idx:end_idx],
+                    sorted_labels[start_idx:end_idx]
+                ))
+                
+                self.temporal_windows.append({
+                    'start': start,
+                    'end': end,
+                    'edges': window_edges
+                })
+                
+                # Free memory
+                if len(self.temporal_windows) % 100 == 0:
+                    torch.cuda.empty_cache()
+        
+        # Free memory
+        del sorted_timestamps, sorted_sources, sorted_targets, sorted_labels
+        torch.cuda.empty_cache()
+        
+        print(f"Created {len(self.temporal_windows)} temporal windows")
+        
+        # Convert edges to tensors efficiently
+        print("Converting to PyTorch tensors...")
+        edge_data = np.array(self.temporal_edges, dtype=[
+            ('src', np.int32),
+            ('dst', np.int32),
+            ('time', np.float32),
+            ('label', np.int32)
+        ])
+        
+        self.edge_timestamps = torch.from_numpy(edge_data['time']).float()
+        self.targets = torch.from_numpy(edge_data['label']).float()
+        
+        # Process node mapping
+        print("\nBuilding node mapping...")
         all_node_ids = np.unique(np.concatenate([sources, targets]))
-        node_id_map = {id_: idx for idx, id_ in enumerate(all_node_ids)}
-        mapped_sources = np.array([node_id_map[x] for x in sources])
-        mapped_targets = np.array([node_id_map[x] for x in targets])
-        self.edge_indices = torch.tensor([mapped_sources, mapped_targets], dtype=torch.long)
+        num_nodes = len(all_node_ids)
+        print(f"Number of unique nodes: {num_nodes}")
+        
+        # Create node ID mapping
+        print("Creating node ID mapping...")
+        node_id_map = {old_id: new_id for new_id, old_id in enumerate(sorted(all_node_ids))}
+        
+        # Map node IDs and validate
+        print("Mapping node IDs...")
+        mapped_sources = np.array([node_id_map[src] for src in sources], dtype=np.int64)
+        mapped_targets = np.array([node_id_map[dst] for dst in targets], dtype=np.int64)
+        
+        # Validate indices
+        max_node_idx = num_nodes - 1
+        assert mapped_sources.max() <= max_node_idx, f"Source index {mapped_sources.max()} >= num_nodes {num_nodes}"
+        assert mapped_targets.max() <= max_node_idx, f"Target index {mapped_targets.max()} >= num_nodes {num_nodes}"
+        assert mapped_sources.min() >= 0, f"Negative source index found: {mapped_sources.min()}"
+        assert mapped_targets.min() >= 0, f"Negative target index found: {mapped_targets.min()}"
+        
+        # Update edge indices with mapped values
+        self.edge_indices = torch.from_numpy(
+            np.stack([mapped_sources, mapped_targets])
+        ).long()
         
         # Create edge features
-        self.edge_features = torch.tensor(features, dtype=torch.float)
+        if self.edge_type_path and os.path.exists(self.edge_type_path):
+            self.edge_features = torch.from_numpy(self._process_edge_features(edge_types)).float()
         
-        # Create edge timestamps
-        self.edge_timestamps = torch.tensor(timestamps, dtype=torch.float)
+        # Process node features
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self._process_node_features(num_nodes, device)
         
-        # Create targets
-        self.targets = torch.tensor(labels, dtype=torch.float)
+        print(f"\nDataset loaded successfully:")
+        print(f"- {len(self.edge_indices[0]):,} edges")
+        print(f"- {num_nodes:,} nodes")
+        print(f"- Node features: {self.node_features.shape}")
+        if self.edge_features is not None:
+            print(f"- Edge features: {self.edge_features.shape}")
+        print(f"- Edge indices range: [{self.edge_indices.min().item()}, {self.edge_indices.max().item()}]")
+        print(f"- Number of unique nodes: {num_nodes}")
+        print(f"- Timestamp range: [{self.min_time}, {self.max_time}]")
+        print(f"- Number of time windows: {len(self.temporal_windows)}")
         
-        # Node features'ı yükle ve eksik değerleri işle
+        # Additional validation
+        if self.edge_indices.max() >= num_nodes:
+            raise ValueError(f"Edge indices contain invalid node IDs. Max index: {self.edge_indices.max()}, num_nodes: {num_nodes}")
+        
+    def _process_edge_features(self, edge_types):
+        """Process edge type features with temporal information."""
+        print(f"Loading edge type features from {self.edge_type_path}...")
+        edge_type_df = pd.read_csv(self.edge_type_path)
+        
+        # Create feature matrix
+        unique_types = np.unique(edge_types)
+        edge_type_features = np.zeros((len(edge_types), edge_type_df.shape[1] - 1), dtype=np.float32)
+        
+        for type_id in tqdm(unique_types, desc="Processing edge types"):
+            mask = edge_types == type_id
+            if mask.any():
+                features = edge_type_df[edge_type_df.iloc[:, 0] == type_id].iloc[:, 1:].values
+                if len(features) > 0:
+                    edge_type_features[mask] = features[0]
+        
+        return np.concatenate([np.expand_dims(edge_types, axis=1), edge_type_features], axis=1)
+    
+    def _process_node_features(self, num_nodes, device):
+        """Process node features with temporal information."""
         try:
             if self.node_feature_path and os.path.exists(self.node_feature_path):
                 node_df = pd.read_csv(self.node_feature_path)
-                print(f"Loaded node features from {self.node_feature_path}")
-                
-                # Eksik değerleri (-1) işle
-                # Her özellik için ayrı bir "eksik değer" kategorisi oluştur
-                node_features = node_df.values
-                n_features = node_features.shape[1]
-                
-                # Her özellik için -1 değerlerini yeni bir kategori olarak işaretle
-                processed_features = []
-                for i in range(n_features):
-                    feature = node_features[:, i]
-                    unique_vals = np.unique(feature[feature != -1])
-                    n_categories = len(unique_vals) + 1  # +1 for missing value category
-                    
-                    # One-hot encoding uygula
-                    one_hot = np.zeros((len(feature), n_categories))
-                    for j, val in enumerate(feature):
-                        if val == -1:
-                            one_hot[j, -1] = 1  # Eksik değer kategorisi
-                        else:
-                            # Değerin indeksini bul
-                            val_idx = np.where(unique_vals == val)[0][0]
-                            one_hot[j, val_idx] = 1
-                    
-                    processed_features.append(one_hot)
-                
-                # Tüm özellikleri birleştir
-                processed_features = np.concatenate(processed_features, axis=1)
-                self.node_features = torch.tensor(processed_features, dtype=torch.float)
+                node_features = self._create_node_feature_matrix(node_df, num_nodes)
+                self.node_features = torch.from_numpy(node_features).to(device)
             else:
-                # Node features yoksa one-hot encoding kullan
-                self.node_features = torch.eye(len(all_node_ids), dtype=torch.float)
+                self.node_features = torch.eye(num_nodes, dtype=torch.float32, device=device)
         except Exception as e:
-            print(f"Warning: Using default node features. Error: {e}")
-            self.node_features = torch.eye(len(all_node_ids), dtype=torch.float)
+            print(f"\nWarning: Using default node features. Error: {e}")
+            self.node_features = torch.eye(num_nodes, dtype=torch.float32, device=device)
+    
+    def _create_node_feature_matrix(self, node_df, num_nodes):
+        """Create node feature matrix with proper handling of temporal features."""
+        node_features = node_df.values
+        if len(node_features) != num_nodes:
+            if len(node_features) < num_nodes:
+                pad_size = num_nodes - len(node_features)
+                node_features = np.pad(node_features, ((0, pad_size), (0, 0)), mode='constant')
+            else:
+                node_features = node_features[:num_nodes]
         
-        print(f"Loaded {len(self.edge_indices[0])} edges, {len(all_node_ids)} nodes")
+        feature_dims = []
+        for j in range(node_features.shape[1]):
+            feature = node_features[:, j]
+            unique_vals = np.unique(feature[feature != -1])
+            feature_dims.append(len(unique_vals) + 1)
+        
+        total_dims = sum(feature_dims)
+        processed_features = np.zeros((num_nodes, total_dims), dtype=np.float32)
+        
+        current_dim = 0
+        for j in range(node_features.shape[1]):
+            feature = node_features[:, j]
+            unique_vals = np.unique(feature[feature != -1])
+            n_categories = feature_dims[j]
+            
+            mask_missing = feature == -1
+            processed_features[mask_missing, current_dim + n_categories - 1] = 1
+            
+            valid_mask = ~mask_missing
+            if valid_mask.any():
+                val_to_idx = {val: idx for idx, val in enumerate(unique_vals)}
+                valid_indices = np.where(valid_mask)[0]
+                valid_values = feature[valid_mask]
+                for idx, val in zip(valid_indices, valid_values):
+                    processed_features[idx, current_dim + val_to_idx[val]] = 1
+            
+            current_dim += n_categories
+        
+        return processed_features
         
     def preprocess(self):
         """
-        Preprocess the loaded data.
+        Preprocess the loaded data with temporal awareness.
         """
         print("Preprocessing data...")
         
-        # Normalize timestamps
-        min_time = self.edge_timestamps.min()
-        max_time = self.edge_timestamps.max()
-        self.edge_timestamps = (self.edge_timestamps - min_time) / (max_time - min_time)
-        
-        # Add timestamp as a feature
-        timestamp_feature = self.edge_timestamps.unsqueeze(1)
-        if self.edge_features is not None:
-            self.edge_features = torch.cat([self.edge_features, timestamp_feature], dim=1)
-        else:
-            self.edge_features = timestamp_feature
+        print("Processing temporal features...")
+        with torch.cuda.amp.autocast():
+            # Normalize timestamps to [0, 1] while preserving temporal gaps
+            time_range = self.max_time - self.min_time
+            self.edge_timestamps = (self.edge_timestamps - self.min_time) / time_range
+            
+            # Create temporal features if they don't exist
+            if self.edge_features is None:
+                self.edge_features = self._create_temporal_features()
+            else:
+                # Add temporal features to existing features
+                time_features = self._create_temporal_features()
+                self.edge_features = torch.cat([self.edge_features, time_features], dim=1)
         
         print("Preprocessing complete")
+    
+    def _create_temporal_features(self):
+        """
+        Create temporal features using vectorized operations.
+        Returns:
+            torch.Tensor: Temporal features tensor
+        """
+        timestamps = self.edge_timestamps.numpy()
+        
+        # Convert timestamps to datetime using vectorized operations
+        # Convert float32 to float64 for datetime conversion
+        timestamps_float = timestamps.astype(np.float64)
+        
+        # Get integer and fractional parts
+        int_timestamps = timestamps_float.astype(np.int64)
+        
+        # Vectorized datetime conversion
+        dates = np.array([datetime.fromtimestamp(ts) for ts in int_timestamps])
+        
+        # Extract temporal features efficiently using vectorized operations
+        hour_of_day = np.array([d.hour for d in dates], dtype=np.float32) / 24.0
+        day_of_week = np.array([d.weekday() for d in dates], dtype=np.float32) / 7.0
+        month = np.array([d.month for d in dates], dtype=np.float32) / 12.0
+        
+        # Time since first event (normalized)
+        time_since_start = (timestamps - timestamps.min()) / (timestamps.max() - timestamps.min())
+        
+        # Combine features and return tensor
+        return torch.from_numpy(
+            np.stack([
+                hour_of_day,
+                day_of_week,
+                month,
+                time_since_start
+            ], axis=1)
+        ).float()
