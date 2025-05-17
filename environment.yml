@@ -1,0 +1,17 @@
+name: temporal-link-prediction
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pytorch
+  - torchvision
+  - torchaudio
+  - numpy
+  - matplotlib
+  - scikit-learn
+  - pandas
+  - pip
+  - pip:
+    - torch-geometric 
