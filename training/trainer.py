@@ -23,326 +23,43 @@ class TemporalLinkPredictionTrainer:
             weight_decay (float): Weight decay
         """
         self.model = model
-        # Enable automatic mixed precision training
-        self.scaler = torch.cuda.amp.GradScaler()
-        self.optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.7, patience=7, verbose=True
-        )
-        # Use BCEWithLogitsLoss instead of BCELoss for numerical stability
-        self.criterion = nn.BCEWithLogitsLoss()
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        self.criterion = nn.BCELoss()
         
-    def train(self, dataset, num_epochs=100, batch_size=32, patience=15, checkpoint_dir=None):
-        """
-        Train the model.
-        
-        Args:
-            dataset: Dataset to train on
-            num_epochs (int): Number of epochs
-            batch_size (int): Batch size
-            patience (int): Patience for early stopping
-            checkpoint_dir (str): Directory to save checkpoints
-            
-        Returns:
-            tuple: (history, test_metrics)
-        """
-        print("Preparing data for training...")
-        
-        # Move dataset to GPU and pin memory for faster data transfer
-        train_samples, val_samples, test_samples = self._generate_link_prediction_samples(dataset)
-        
-        # Create data loaders with optimized settings
-        train_loader = self._create_data_loader(train_samples, batch_size, pin_memory=True, num_workers=4)
-        val_loader = self._create_data_loader(val_samples, batch_size, pin_memory=True, num_workers=4)
-        test_loader = self._create_data_loader(test_samples, batch_size, pin_memory=True, num_workers=4)
-        
-        # Initialize variables for training
-        best_val_loss = float('inf')
-        best_epoch = 0
-        patience_counter = 0
-        max_grad_norm = 2.0
-        
-        # Initialize history
-        history = {
-            'train_loss': [],
-            'val_loss': [],
-            'val_auc': [],
-            'val_ap': [],
-            'val_f1': [],
-            'learning_rates': []
-        }
-        
-        print(f"\nStarting training:")
-        print(f"- Total epochs: {num_epochs}")
-        print(f"- Batches per epoch: {len(train_loader)}")
-        print(f"- Total batches: {num_epochs * len(train_loader)}")
-        
-        # Enable CUDA benchmarking for faster training
-        torch.backends.cudnn.benchmark = True
-        
-        # Training loop with progress bar
-        epoch_pbar = tqdm(range(num_epochs), desc='Training Progress', position=0)
-        
-        for epoch in epoch_pbar:
-            epoch_pbar.set_description(f"Epoch {epoch + 1}/{num_epochs}")
-            
-            # Train
-            train_loss = self._train_epoch(train_loader, dataset.node_features, 
-                                         dataset.edge_indices, max_grad_norm,
-                                         epoch=epoch, num_epochs=num_epochs)
-            
-            # Validate
-            val_loss, val_metrics = self._validate(val_loader, dataset.node_features, 
-                                                 dataset.edge_indices)
-            
-            # Update learning rate
-            self.scheduler.step(val_loss)
-            current_lr = self.optimizer.param_groups[0]['lr']
-            
-            # Update history
-            history['train_loss'].append(train_loss)
-            history['val_loss'].append(val_loss)
-            history['val_auc'].append(val_metrics['auc'])
-            history['val_ap'].append(val_metrics['ap'])
-            history['val_f1'].append(val_metrics['f1'])
-            history['learning_rates'].append(current_lr)
-            
-            # Update progress bar description
-            epoch_pbar.set_postfix({
-                'train_loss': f'{train_loss:.4f}',
-                'val_loss': f'{val_loss:.4f}',
-                'val_auc': f'{val_metrics["auc"]:.4f}',
-                'lr': f'{current_lr:.6f}'
-            })
-            
-            # Print epoch summary
-            print(f"\nEpoch {epoch + 1}/{num_epochs} Summary:")
-            print(f"  Train Loss: {train_loss:.4f}")
-            print(f"  Val Loss: {val_loss:.4f}")
-            print(f"  Val AUC: {val_metrics['auc']:.4f}")
-            print(f"  Val AP: {val_metrics['ap']:.4f}")
-            print(f"  Val F1: {val_metrics['f1']:.4f}")
-            print(f"  Learning Rate: {current_lr:.6f}")
-            
-            # Check for improvement
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_epoch = epoch
-                patience_counter = 0
-                
-                # Save checkpoint
-                if checkpoint_dir:
-                    os.makedirs(checkpoint_dir, exist_ok=True)
-                    checkpoint = {
-                        'epoch': epoch,
-                        'model_state_dict': self.model.state_dict(),
-                        'optimizer_state_dict': self.optimizer.state_dict(),
-                        'scheduler_state_dict': self.scheduler.state_dict(),
-                        'scaler_state_dict': self.scaler.state_dict(),
-                        'val_loss': val_loss,
-                        'val_metrics': val_metrics
-                    }
-                    torch.save(checkpoint, os.path.join(checkpoint_dir, 'best_model.pt'))
-                    print(f"  Saved checkpoint (best model so far)")
-            else:
-                patience_counter += 1
-                print(f"  No improvement for {patience_counter} epochs")
-            
-            # Early stopping
-            if patience_counter >= patience:
-                print(f"\nEarly stopping at epoch {epoch+1}")
-                break
-        
-        print(f"\nTraining completed. Best epoch: {best_epoch+1}")
-        
-        # Load best model
-        if checkpoint_dir and os.path.exists(os.path.join(checkpoint_dir, 'best_model.pt')):
-            checkpoint = torch.load(os.path.join(checkpoint_dir, 'best_model.pt'))
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            
-        # Evaluate on test set
-        _, test_metrics = self._validate(test_loader, dataset.node_features, dataset.edge_indices)
-        
-        return history, test_metrics
-    
-    def _train_epoch(self, train_loader, node_features, edge_indices, max_grad_norm, epoch=0, num_epochs=1):
-        """
-        Train for one epoch with mixed precision training and gradient accumulation.
-        """
+    def train(self, dataset, num_epochs, batch_size):
         self.model.train()
-        total_loss = 0
-        device = next(self.model.parameters()).device
-        num_nodes = node_features.size(0)
         
-        # Ensure edge_indices is properly formatted
-        if edge_indices.dim() == 1:
-            edge_indices = edge_indices.view(2, -1)
-        elif edge_indices.dim() == 2 and edge_indices.size(0) != 2:
-            edge_indices = edge_indices.t()
+        for epoch in range(num_epochs):
+            h, c = None, None  # Initialize LSTM hidden states
+            total_loss = 0
             
-        # Validate edge indices
-        assert edge_indices.max() < num_nodes, f"Edge index {edge_indices.max()} >= num_nodes {num_nodes}"
-        assert edge_indices.min() >= 0, f"Negative edge index found: {edge_indices.min()}"
-        
-        # Use tqdm for progress tracking
-        batch_pbar = tqdm(
-            train_loader,
-            desc=f'Epoch {epoch + 1}/{num_epochs}',
-            leave=False,
-            position=1
-        )
-        
-        # Gradient accumulation settings
-        accumulation_steps = 4  # Adjust based on GPU memory
-        self.optimizer.zero_grad(set_to_none=True)
-        
-        for batch_idx, batch in enumerate(batch_pbar):
-            # Move batch to device
-            batch = self._move_batch_to_device(batch, device)
-            pos_edge_index, neg_edge_index, _ = batch
-            
-            # Validate batch indices
-            for edge_set, name in [(pos_edge_index, "positive"), (neg_edge_index, "negative")]:
-                if edge_set.dim() == 1:
-                    edge_set = edge_set.view(2, -1)
-                elif edge_set.dim() == 2 and edge_set.size(0) != 2:
-                    edge_set = edge_set.t()
+            # Iterate over temporal snapshots
+            for time_idx, snapshot in enumerate(dataset.temporal_signal):
+                # Get data for current timestamp
+                x = snapshot.x
+                edge_index = snapshot.edge_index
+                edge_weight = snapshot.edge_attr
+                target = snapshot.y
                 
-                max_idx = edge_set.max()
-                min_idx = edge_set.min()
-                if max_idx >= num_nodes:
-                    raise ValueError(f"Batch {name} edge index {max_idx} >= num_nodes {num_nodes}")
-                if min_idx < 0:
-                    raise ValueError(f"Batch {name} edge index {min_idx} < 0")
-            
-            # Forward pass with mixed precision
-            with torch.cuda.amp.autocast():
-                # Compute node embeddings for this batch
-                node_embeddings = self.model(node_features, edge_indices)
+                # Forward pass
+                out, h, c = self.model(x, edge_index, edge_weight, h, c)
                 
                 # Predict links
-                pos_pred = self.model.predict_link(node_embeddings, pos_edge_index)
-                neg_pred = self.model.predict_link(node_embeddings, neg_edge_index)
+                pred = self.model.predict_link(out, edge_index)
                 
-                # Create targets with label smoothing
-                pos_target = torch.ones_like(pos_pred) * 0.9  # Label smoothing
-                neg_target = torch.zeros_like(neg_pred) * 0.1
-                
-                # Combine predictions and targets
-                pred = torch.cat([pos_pred, neg_pred])
-                target = torch.cat([pos_target, neg_target])
-                
-                # Compute loss with stability
-                loss = self.criterion(pred, target) / accumulation_steps
-            
-            # Backward pass with gradient scaling
-            self.scaler.scale(loss).backward()
-            
-            # Update weights every accumulation_steps
-            if (batch_idx + 1) % accumulation_steps == 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.optimizer.zero_grad(set_to_none=True)
-            
-            total_loss += loss.item() * accumulation_steps
-            
-            # Update progress bar with smoothed loss
-            smoothing = 0.1
-            if batch_idx == 0:
-                smoothed_loss = loss.item() * accumulation_steps
-            else:
-                smoothed_loss = smoothing * loss.item() * accumulation_steps + (1 - smoothing) * smoothed_loss
-            
-            batch_pbar.set_postfix({
-                'batch': f'{batch_idx+1}/{len(train_loader)}',
-                'loss': f'{smoothed_loss:.4f}',
-                'avg_loss': f'{total_loss/(batch_idx+1):.4f}'
-            })
-            
-            # Clear memory
-            del batch, pos_edge_index, neg_edge_index, pos_pred, neg_pred, node_embeddings
-            if (batch_idx + 1) % 50 == 0:  # Periodic memory cleanup
-                torch.cuda.empty_cache()
-        
-        return total_loss / len(train_loader)
-    
-    def _validate(self, val_loader, node_features, edge_indices):
-        """
-        Validate the model with mixed precision inference.
-        """
-        self.model.eval()
-        total_loss = 0
-        all_preds = []
-        all_targets = []
-        device = next(self.model.parameters()).device
-        
-        # Ensure edge_indices is properly formatted
-        if edge_indices.dim() == 1:
-            edge_indices = edge_indices.view(2, -1)
-        elif edge_indices.dim() == 2 and edge_indices.size(0) != 2:
-            edge_indices = edge_indices.t()
-        
-        with torch.no_grad(), torch.cuda.amp.autocast():
-            # Get node embeddings using validation_forward
-            node_embeddings = self.model.validation_forward(node_features, edge_indices)
-            
-            for batch in val_loader:
-                # Move batch to device
-                batch = self._move_batch_to_device(batch, device)
-                pos_edge_index, neg_edge_index, _ = batch
-                
-                # Ensure batch edge indices are properly formatted
-                if pos_edge_index.dim() == 1:
-                    pos_edge_index = pos_edge_index.view(2, -1)
-                elif pos_edge_index.dim() == 2 and pos_edge_index.size(0) != 2:
-                    pos_edge_index = pos_edge_index.t()
-                    
-                if neg_edge_index.dim() == 1:
-                    neg_edge_index = neg_edge_index.view(2, -1)
-                elif neg_edge_index.dim() == 2 and neg_edge_index.size(0) != 2:
-                    neg_edge_index = neg_edge_index.t()
-                
-                # Predict links using cached node embeddings
-                pos_pred = self.model.predict_link(node_embeddings, pos_edge_index)
-                neg_pred = self.model.predict_link(node_embeddings, neg_edge_index)
-                
-                # Create targets
-                pos_target = torch.ones_like(pos_pred)
-                neg_target = torch.zeros_like(neg_pred)
-                
-                # Combine predictions and targets
-                pred = torch.cat([pos_pred, neg_pred])
-                target = torch.cat([pos_target, neg_target])
-                
-                # Compute loss
+                # Calculate loss
                 loss = self.criterion(pred, target)
+                
+                # Backward pass
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                
                 total_loss += loss.item()
-                
-                # Store predictions and targets for metrics
-                all_preds.append(pred.cpu())
-                all_targets.append(target.cpu())
-                
-                # Clear memory
-                del batch, pos_edge_index, neg_edge_index, pos_pred, neg_pred
-                torch.cuda.empty_cache()
-                
-        # Compute metrics
-        all_preds = torch.cat(all_preds).numpy()
-        all_targets = torch.cat(all_targets).numpy()
-        
-        auc = roc_auc_score(all_targets, all_preds)
-        ap = average_precision_score(all_targets, all_preds)
-        f1 = f1_score(all_targets, all_preds > 0.5)
-        
-        metrics = {
-            'auc': auc,
-            'ap': ap,
-            'f1': f1
-        }
-        
-        return total_loss / len(val_loader), metrics
+            
+            # Print epoch statistics
+            avg_loss = total_loss / (time_idx + 1)
+            print(f"Epoch {epoch}: Average Loss = {avg_loss:.4f}")
     
     def _generate_link_prediction_samples(self, dataset):
         """
