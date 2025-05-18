@@ -3,34 +3,32 @@ import torch
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-from data.dataset_a import EventBasedDataset
+import json
+from data.dataset_a import EventBasedDataset, TemporalSignal
 from models.temporal_gat import TemporalGAT
 from training.trainer import TemporalLinkPredictionTrainer
+from torch_geometric.loader import DataLoader
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Temporal Link Prediction')
-    parser.add_argument('--hidden_channels', type=int, default=256,
-                        help='Number of hidden channels')
-    parser.add_argument('--num_heads', type=int, default=16,
-                        help='Number of attention heads')
-    parser.add_argument('--dropout', type=float, default=0.2,
-                        help='Dropout probability')
-    parser.add_argument('--lr', type=float, default=0.001,
-                        help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=5e-4,
-                        help='Weight decay')
-    parser.add_argument('--batch_size', type=int, default=512,
-                        help='Batch size')
-    parser.add_argument('--epochs', type=int, default=100,
-                        help='Number of epochs')
-    parser.add_argument('--patience', type=int, default=15,
-                        help='Patience for early stopping')
-    parser.add_argument('--time_window', type=int, default=7,
-                        help='Time window for prediction (in days)')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed')
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+    parser = argparse.ArgumentParser(description='Temporal Link Prediction - Forecasting Mode')
+    parser.add_argument('--hidden_channels', type=int, default=256)
+    parser.add_argument('--num_heads', type=int, default=8)
+    parser.add_argument('--dropout', type=float, default=0.2)
+    parser.add_argument('--lr', type=float, default=1e-5)
+    parser.add_argument('--weight_decay', type=float, default=5e-4)
+    parser.add_argument('--batch_size', type=int, default=1,
+                        help='Number of graphs to batch together for GNN processing')
+    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--patience', type=int, default=10)
+    parser.add_argument('--time_window', type=int, default=None,
+                        help='Time window (not actively used for 1-step forecasting setup)')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints_forecast',
                         help='Directory to save checkpoints')
+    parser.add_argument('--data_path', type=str, default='data/edges_train_A_sample.csv',
+                        help='Path to the dataset CSV file')
+    parser.add_argument('--neg_sampling_ratio', type=int, default=1,
+                        help='Ratio of negative to positive samples during training/evaluation')
     
     return parser.parse_args()
 
@@ -42,120 +40,139 @@ def set_seed(seed):
 def plot_training_history(history, save_path):
     plt.figure(figsize=(12, 4))
     
-    # Plot loss
     plt.subplot(1, 2, 1)
-    plt.plot(history['train_loss'], label='Train Loss')
-    plt.plot(history['val_loss'], label='Validation Loss')
+    plt.plot(history.get('train_loss', []), label='Train Loss')
+    plt.plot(history.get('val_loss', []), label='Validation Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.title('Training and Validation Loss')
     plt.legend()
     
-    # Plot metrics
     plt.subplot(1, 2, 2)
-    plt.plot(history['val_auc'], label='AUC')
-    plt.plot(history['val_ap'], label='AP')
-    plt.plot(history['val_f1'], label='F1')
+    plt.plot(history.get('val_auc', []), label='Val AUC')
+    plt.plot(history.get('val_ap', []), label='Val AP')
+    plt.plot(history.get('val_f1', []), label='Val F1')
     plt.xlabel('Epoch')
     plt.ylabel('Score')
-    plt.title('Validation Metrics')
+    plt.title('Validation Metrics (Forecasting)')
     plt.legend()
     
     plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path)
     plt.close()
 
+def save_training_history_to_file(history, save_path):
+    """Saves the training history dictionary to a JSON file."""
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    with open(save_path, 'w') as f:
+        json.dump(history, f, indent=4)
+    print(f"Training history saved to {save_path}")
+
 def main():
-    # Parse arguments
     args = parse_args()
-    
-    # Set random seed
     set_seed(args.seed)
     
-    # Create directories
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    os.makedirs('results', exist_ok=True)
+    unique_checkpoint_dir = os.path.join(args.checkpoint_dir, os.path.splitext(os.path.basename(args.data_path))[0])
+    os.makedirs(unique_checkpoint_dir, exist_ok=True)
+    results_dir = os.path.join('results', os.path.splitext(os.path.basename(args.data_path))[0])
+    os.makedirs(results_dir, exist_ok=True)
     
-    # Print GPU information
     if torch.cuda.is_available():
         print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-        print(f"CUDA Version: {torch.version.cuda}")
-        print(f"PyTorch Version: {torch.__version__}")
-        
-        # Enable CUDA optimizations
         torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 on Ampere
+        torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        
-        # Set memory allocation settings
-        torch.cuda.empty_cache()
-        torch.cuda.set_per_process_memory_fraction(0.95)  # Use 95% of available GPU memory
     else:
         print("No GPU available, using CPU")
-    
-    # Calculate optimal batch size based on available GPU memory
-    if torch.cuda.is_available():
-        gpu_mem = torch.cuda.get_device_properties(0).total_memory
-        # Adjust batch size based on available memory (rough estimation)
-        optimal_batch = min(args.batch_size, int(gpu_mem / (2 * 1024 * 1024 * 1024) * 1024))
-        args.batch_size = optimal_batch
-        print(f"Adjusted batch size to {optimal_batch} based on GPU memory")
-    
-    # Load dataset A
-    print("Loading and preprocessing dataset...")
-    dataset = EventBasedDataset(name='dataset_a', time_window=args.time_window)
-    dataset.load_data('data/edges_train_A.csv')
-    dataset.preprocess()
-    
-    # Move dataset to GPU if available
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    dataset.node_features = dataset.node_features.to(device)
-    dataset.edge_indices = dataset.edge_indices.to(device)
-    dataset.edge_features = dataset.edge_features.to(device)
-    dataset.edge_timestamps = dataset.edge_timestamps.to(device)
-    dataset.targets = dataset.targets.to(device)
+
+    print("Loading and preprocessing dataset for forecasting...")
+    dataset = EventBasedDataset(name=os.path.splitext(os.path.basename(args.data_path))[0])
+    dataset.load_data(args.data_path)
+
+    full_signal_instances = dataset.temporal_signal.instances
+
+    if not full_signal_instances:
+        print("No forecasting instances were loaded. Exiting.")
+        return
+
+    num_total_instances = len(full_signal_instances)
+    train_size = int(0.7 * num_total_instances)
+    val_size = int(0.15 * num_total_instances)
+    test_size = num_total_instances - train_size - val_size
+
+    print(f"Splitting dataset into: Train ({train_size}), Validation ({val_size}), Test ({test_size}) forecasting instances")
+
+    train_signal_instances = full_signal_instances[:train_size]
+    val_signal_instances = full_signal_instances[train_size : train_size + val_size]
+    test_signal_instances = full_signal_instances[train_size + val_size:]
     
-    print(f"Training on dataset A using {device}")
-    
-    # Create GAT model
+    if not train_signal_instances:
+        print("No training instances after split. Exiting.")
+        return
+    if not val_signal_instances:
+        print("Warning: No validation instances after split. Validation metrics will be zero.")
+    if not test_signal_instances:
+        print("Warning: No test instances after split. Test metrics will be zero.")
+
+    node_feature_dim = train_signal_instances[0].x.size(1)
+    print(f"Node feature dimension for GAT model: {node_feature_dim}")
+
+    num_dataloader_workers = 0 if args.batch_size == 1 else 2
+
+    train_loader = DataLoader(train_signal_instances, batch_size=args.batch_size, shuffle=True, num_workers=num_dataloader_workers, pin_memory=True) if train_signal_instances else None
+    val_loader = DataLoader(val_signal_instances, batch_size=args.batch_size, shuffle=False, num_workers=num_dataloader_workers, pin_memory=True) if val_signal_instances else None
+    test_loader = DataLoader(test_signal_instances, batch_size=args.batch_size, shuffle=False, num_workers=num_dataloader_workers, pin_memory=True) if test_signal_instances else None 
+
+    if not train_loader:
+        print("Train loader is empty. Cannot proceed with training. Exiting.")
+        return
+
+    print(f"Train DataLoader: {len(train_loader) if train_loader else 0} batches, Val DataLoader: {len(val_loader) if val_loader else 0} batches, Test DataLoader: {len(test_loader) if test_loader else 0} batches")
+
     model = TemporalGAT(
-        node_features=dataset.node_features.size(1),
+        node_features=node_feature_dim,
         hidden_channels=args.hidden_channels,
         num_heads=args.num_heads,
         dropout=args.dropout
     ).to(device)
     
-    # Enable gradient checkpointing for memory efficiency
     if hasattr(model, 'gradient_checkpointing_enable'):
         model.gradient_checkpointing_enable()
     
-    # Create trainer
+    print(f"Training on {dataset.name} using {device} (Forecasting Mode)")
+    
     trainer = TemporalLinkPredictionTrainer(
         model=model,
         lr=args.lr,
         weight_decay=args.weight_decay
     )
     
-    # Train model
     history, test_metrics = trainer.train(
-        dataset=dataset,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
         num_epochs=args.epochs,
-        batch_size=args.batch_size,
         patience=args.patience,
-        checkpoint_dir=os.path.join(args.checkpoint_dir, dataset.name)
+        checkpoint_dir=unique_checkpoint_dir,
+        neg_sampling_ratio=args.neg_sampling_ratio
     )
     
-    # Plot training history
     plot_training_history(
         history=history,
-        save_path=f"results/dataset_a_training_history.png"
+        save_path=os.path.join(results_dir, f"{dataset.name}_training_history_forecast.png")
+    )
+    save_training_history_to_file(
+        history=history,
+        save_path=os.path.join(results_dir, f"{dataset.name}_training_history_forecast.json")
     )
     
-    # Print test metrics
-    print(f"\nTest metrics for dataset A:")
-    print(f"  AUC: {test_metrics['auc']:.4f}")
-    print(f"  AP: {test_metrics['ap']:.4f}")
-    print(f"  F1: {test_metrics['f1']:.4f}")
+    print(f"\nTest metrics for {dataset.name} (Forecasting Mode):")
+    print(f"  Loss: {test_metrics.get('loss', float('nan')):.4f}")
+    print(f"  AUC: {test_metrics.get('auc', 0.0):.4f}")
+    print(f"  AP: {test_metrics.get('ap', 0.0):.4f}")
+    print(f"  F1: {test_metrics.get('f1', 0.0):.4f}")
 
 if __name__ == '__main__':
     main()
